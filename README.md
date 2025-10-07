@@ -79,6 +79,8 @@ Production-ready AWS ECS infrastructure with complete CI/CD pipeline, Infrastruc
                     │
               Internet
 ```
+<img width="1024" height="1536" alt="image" src="https://github.com/user-attachments/assets/e9cf0504-1da4-4c09-9f94-69cd10b987a5" />
+
 
 ### Network Architecture
 
