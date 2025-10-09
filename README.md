@@ -410,8 +410,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 👤 Author
 
-**Your Name**
-<<<<<<< HEAD
+**Franklin Chinonso**
+
 - GitHub: (https://github.com/franklinosuji2-afk/)
 - LinkedIn: (https://www.linkedin.com/in/franklin-osuji-a96003321/)
 
@@ -423,12 +423,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Docker Best Practices
 - DevOps Community
 
----
+
 
 ⭐ If you find this project helpful, please give it a star!
-
-<<<<<<< HEAD
-📧 For questions or feedback, please open an issue.
-=======
-📧 For questions or feedback, please open an issue.
->>>>>>> c7506ca (fix: Update deprecated GitHub Actions to v4 and fix npm scripts)
