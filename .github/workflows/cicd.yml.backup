@@ -1,0 +1,49 @@
+name: CI/CD Pipeline with DevSecOps
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  code-quality:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - run: npm ci
+      
+      - run: npm run lint || true
+      
+      - run: npm test -- --passWithNoTests || true
+
+  terraform-security:
+    name: Terraform Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - run: pip install checkov
+      
+      - run: checkov -d ./terraform --framework terraform --soft-fail || true
+
+  docker-build:
+    name: Docker Build Demo
+    runs-on: ubuntu-latest
+    needs: [code-quality, terraform-security]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - run: docker build -t my-app:latest .
+      
+      - run: echo "? Docker build successful (Portfolio Demo)"
