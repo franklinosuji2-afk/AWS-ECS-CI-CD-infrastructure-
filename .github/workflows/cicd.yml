@@ -1,0 +1,319 @@
+name: AWS ECS CI/CD Pipeline
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: my-app
+  ECS_CLUSTER_DEV: my-app-dev-cluster
+  ECS_SERVICE_DEV: my-app-dev
+  ECS_CLUSTER_PROD: my-app-prod-cluster
+  ECS_SERVICE_PROD: my-app-prod
+  CONTAINER_NAME: my-app
+
+jobs:
+  # Job 1: Code Quality & Testing
+  quality:
+    name: Code Quality & Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Linter
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Run Unit Tests
+        run: npm test
+
+      - name: Upload Coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage/lcov.info
+          flags: unittests
+        continue-on-error: true
+
+  # Job 2: Security Scanning
+  security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy Container Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Run Checkov IaC Security Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: terraform/
+          framework: terraform
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+        continue-on-error: true
+
+      - name: Upload Checkov Results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: checkov-results.sarif
+        continue-on-error: true
+
+  # Job 3: Build & Push Docker Image
+  build:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: [quality, security]
+    if: github.event_name == 'push'
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract Metadata
+        id: meta
+        run: |
+          BRANCH=${GITHUB_REF#refs/heads/}
+          SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7)
+          IMAGE_TAG="${BRANCH}-${SHORT_SHA}"
+          echo "tags=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "latest=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest" >> $GITHUB_OUTPUT
+
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ steps.meta.outputs.tags }} .
+          docker tag ${{ steps.meta.outputs.tags }} ${{ steps.meta.outputs.latest }}
+
+      - name: Scan Docker Image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.tags }}
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Push to ECR
+        run: |
+          docker push ${{ steps.meta.outputs.tags }}
+          docker push ${{ steps.meta.outputs.latest }}
+
+      - name: Output Image Details
+        run: |
+          echo "Image pushed: ${{ steps.meta.outputs.tags }}"
+          echo "Latest tag: ${{ steps.meta.outputs.latest }}"
+
+  # Job 4: Deploy to Development
+  deploy-dev:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: development
+      url: ${{ steps.get-alb.outputs.url }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition my-app-dev \
+            --query taskDefinition > task-definition.json
+
+      - name: Update Task Definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.build.outputs.image-tag }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE_DEV }}
+          cluster: ${{ env.ECS_CLUSTER_DEV }}
+          wait-for-service-stability: true
+
+      - name: Get ALB URL
+        id: get-alb
+        run: |
+          ALB_URL=$(aws elbv2 describe-load-balancers \
+            --names my-app-dev-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          echo "url=http://${ALB_URL}" >> $GITHUB_OUTPUT
+          echo "Deployment URL: http://${ALB_URL}"
+
+  # Job 5: Deploy to Production
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+      url: ${{ steps.get-alb.outputs.url }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare Task Definition
+        run: |
+          # Create new task definition with new image
+          aws ecs describe-task-definition \
+            --task-definition my-app-prod \
+            --query taskDefinition > task-def.json
+          
+          # Update image in task definition
+          cat task-def.json | \
+            jq --arg IMAGE "${{ needs.build.outputs.image-tag }}" \
+            '.containerDefinitions[0].image = $IMAGE' > new-task-def.json
+
+      - name: Register New Task Definition
+        id: register-task
+        run: |
+          TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "task-def-arn=${TASK_DEF_ARN}" >> $GITHUB_OUTPUT
+
+      - name: Create CodeDeploy Deployment
+        id: deploy
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name my-app-prod \
+            --deployment-group-name my-app-dg-prod \
+            --revision revisionType=AppSpecContent,appSpecContent={content='{
+              "version": 0.0,
+              "Resources": [{
+                "TargetService": {
+                  "Type": "AWS::ECS::Service",
+                  "Properties": {
+                    "TaskDefinition": "${{ steps.register-task.outputs.task-def-arn }}",
+                    "LoadBalancerInfo": {
+                      "ContainerName": "my-app",
+                      "ContainerPort": 3000
+                    }
+                  }
+                }
+              }]
+            }'} \
+            --query 'deploymentId' \
+            --output text)
+          echo "deployment-id=${DEPLOYMENT_ID}" >> $GITHUB_OUTPUT
+
+      - name: Wait for Deployment
+        run: |
+          aws deploy wait deployment-successful \
+            --deployment-id ${{ steps.deploy.outputs.deployment-id }}
+
+      - name: Get ALB URL
+        id: get-alb
+        run: |
+          ALB_URL=$(aws elbv2 describe-load-balancers \
+            --names my-app-prod-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          echo "url=http://${ALB_URL}" >> $GITHUB_OUTPUT
+          echo "Production URL: http://${ALB_URL}"
+
+      - name: Deployment Success Notification
+        run: |
+          echo "✅ Production deployment successful!"
+          echo "Deployment ID: ${{ steps.deploy.outputs.deployment-id }}"
+          echo "Task Definition: ${{ steps.register-task.outputs.task-def-arn }}"
+
+  # Job 6: Smoke Tests
+  smoke-test:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [deploy-dev]
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Wait for Service Stability
+        run: sleep 30
+
+      - name: Health Check
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" ${{ needs.deploy-dev.outputs.url }}/health)
+          if [ $RESPONSE -eq 200 ]; then
+            echo "✅ Health check passed"
+          else
+            echo "❌ Health check failed with status: $RESPONSE"
+            exit 1
+          fi
+
+      - name: Test Main Endpoint
+        run: |
+          RESPONSE=$(curl -s ${{ needs.deploy-dev.outputs.url }}/)
+          echo "Response: $RESPONSE"
+          if echo "$RESPONSE" | grep -q "Welcome"; then
+            echo "✅ Main endpoint test passed"
+          else
+            echo "❌ Main endpoint test failed"
+            exit 1
+          fi
